@@ -28,6 +28,7 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
         return sorted(refs, key=operator.attrgetter('name'))
 
     def get_items(self, uri):
+        logger.info("Get items for playlist: %s", uri)
         if self._playlists is None:
             self.refresh()
 
@@ -43,6 +44,7 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
         pass  # TODO
 
     def lookup(self, uri):
+        logger.info("Lookup playlist: %s", uri)
         return self._playlists.get(uri)
 
     def refresh(self):
@@ -65,9 +67,32 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
                                       name=pl.name,
                                       tracks=tracks,
                                       last_modified=pl.last_updated)
-
+        playlists.update(self.get_mixes_as_playlists())
         self._playlists = playlists
         backend.BackendListener.send('playlists_loaded')
+
+    def get_mixes_as_playlists(self):
+        """Return the mixes for a user as :class:`mopidy.models.Playlist` objects.
+
+        :returns: A dict containing the mixes as :class:`mopidy.models.Playlist` objects (with the URI as key).
+        :rtype: dict[str, Playlist]
+        """
+        playlists = {}
+        session = self.backend._session
+        rows = session.request('GET', 'pages/home', dict(deviceType='BROWSER')
+                               ).json()['rows']
+        for row in rows:
+            for module in row.get('modules', []):
+                if module['title'] != 'Mixes For You':
+                    continue
+                for mix in module['pagedList']['items']:
+                    uri = "tidal:mix:" + mix['id']
+                    tracks = self.backend.get_tracks_for_mix(mix['id'])
+                    playlists[uri] = Playlist(uri=uri,
+                                              name=mix['title'],
+                                              tracks=tracks,
+                                              last_modified=None)
+        return playlists
 
     def save(self, playlist):
         pass  # TODO

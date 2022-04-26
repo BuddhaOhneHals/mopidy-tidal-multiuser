@@ -2,7 +2,6 @@ from __future__ import unicode_literals
 
 import logging
 import os
-import sys
 import json
 
 from mopidy import backend
@@ -11,8 +10,7 @@ from pykka import ThreadingActor
 
 from tidalapi import Config, Session, Quality
 
-from mopidy_tidal import library, playback, playlists, Extension
-
+from . import library, playback, playlists, Extension, full_models_mappers
 
 logger = logging.getLogger(__name__)
 
@@ -88,3 +86,14 @@ class TidalBackend(ThreadingActor, backend.Backend):
         else:
             logger.info("TIDAL Login KO")
 
+    def get_tracks_for_mix(self, mix_id):
+        """Return the tracks for a mix.
+
+        :param str mix_id: The ID of the mix
+        :returns: A list of Track objects
+        :rtype: list[mopidy.models.Track]
+        """
+        # Mixes are not supported in `tidalapi` in version 0.6.x. Therefore, the request must be made by using an
+        # internal method of the tidalapi.Session object.
+        tracks = self._session._map_request('mixes/{}/items'.format(mix_id), ret='track')
+        return full_models_mappers.create_mopidy_tracks(tracks)
