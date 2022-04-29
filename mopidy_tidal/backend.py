@@ -2,7 +2,6 @@ from __future__ import unicode_literals
 
 import logging
 import os
-import sys
 import json
 from collections import namedtuple
 
@@ -12,7 +11,7 @@ from pykka import ThreadingActor
 
 from tidalapi import Config, Session, Quality
 
-from mopidy_tidal import library, playback, playlists, Extension
+from . import library, playback, playlists, Extension
 
 
 logger = logging.getLogger(__name__)
@@ -27,13 +26,16 @@ class TidalBackendConfig(namedtuple('TidalBackendConfig', 'quality client_id cli
         return self.profiles[0] if self.has_profiles() else None
 
 
+class LegacyOAuthSessionDataFormat(Exception):
+    pass
+
+
 class TidalBackend(ThreadingActor, backend.Backend):
     def __init__(self, config, audio):
-        logger.info('Bla')
         super(TidalBackend, self).__init__()
         self._session = None
-        self._user_config = config['tidal']
-        self.config = self.validate_config(config['tidal'])
+        self._config = config
+        self.backend_config = self.validate_config(config['tidal'])
         self.playback = playback.TidalPlaybackProvider(audio=audio,
                                                        backend=self)
         self.library = library.TidalLibraryProvider(backend=self)
@@ -47,10 +49,10 @@ class TidalBackend(ThreadingActor, backend.Backend):
         :returns: A validated configuration
         :rtype: TidalBackendConfig
         """
-        quality = Quality(config['quantity'])
+        quality = Quality(config['quality'])
         client_id = config['client_id']
         client_secret = config['client_secret']
-        profiles = config['profiles'].split(',') if config['profiles'] else []
+        profiles = config['profiles']
         if client_id and client_secret:
             logger.info("client_id & client_secret from config section are used.")
         else:
@@ -71,8 +73,9 @@ class TidalBackend(ThreadingActor, backend.Backend):
             tidal_config.api_token = config.client_id
         return tidal_config
 
-    def oauth_login_new_session(self, oauth_file):
+    def oauth_login_new_session(self, profile):
         # create a new session
+        logger.info("Creating new OAuth session for %s", profile)
         self._session.login_oauth_simple(function=logger.info)
         if self._session.check_login():
             # store current OAuth session
@@ -82,35 +85,67 @@ class TidalBackend(ThreadingActor, backend.Backend):
                 'access_token': self._session.access_token,
                 'refresh_token': self._session.refresh_token,
             }
+            oauth_file = self.get_oauth_config_file_path(profile)
             with open(oauth_file, 'w') as outfile:
                 json.dump(data, outfile)
 
-    def get_oauth_config_file_path(self, profile='default'):
-        data_dir = Extension.get_data_dir(self._user_config)
-        return os.path.join(data_dir, 'tidal-oauth-{}.json'.format(profile))
+    def transform_legacy_oauth_data_file(self, file_path):
+        """Transform a file containing OAuth session data in a legacy format into the current format.
+
+        :param str file_path: Path to the file containing the OAuth session data
+        """
+        with open(file_path) as f:
+            data = json.load(f)
+        transformed_data = {
+            key: value['data'] for key, value in data.items()
+        }
+        with open(file_path, 'w') as outfile:
+            json.dump(transformed_data, outfile)
+
+    def get_oauth_config_file_path(self, profile=None):
+        data_dir = Extension.get_data_dir(self._config)
+        file_name = 'tidal-oauth-{}.json'.format(profile) if profile else 'tidal-oauth.json'
+        return os.path.join(data_dir, file_name)
+
+    def read_oauth_data_file(self, profile_file_path):
+        logger.info("Loading OAuth session from %s.", profile_file_path)
+        with open(profile_file_path) as f:
+            data = json.load(f)
+            # Check for incompatible (legacy) data structure
+            if any(filter(lambda x: isinstance(x, dict), data.values())):
+                raise LegacyOAuthSessionDataFormat()
+            session_id = data['session_id']
+            token_type = data['token_type']
+            access_token = data['access_token']
+            refresh_token = data['refresh_token']
+        return session_id, token_type, access_token, refresh_token
+
+    def try_login_with_existing_data(self):
+        oauth_file = self.get_oauth_config_file_path(self.backend_config.default_profile)
+        try:
+            session_id, token_type, access_token, refresh_token = self.read_oauth_data_file(oauth_file)
+        except OSError as exc:
+            # An error occurred while reading the file (not existent, missing permissions, ...)
+            logger.info('Cannot read OAuth session data from %s: %s', oauth_file, exc)
+            return False
+        except json.decoder.JSONDecodeError as exc:
+            # The contents of the file couldn't be read as JSON data
+            logger.warning('Cannot parse OAuth session data from %s: %s', oauth_file, exc)
+            return False
+        except LegacyOAuthSessionDataFormat:
+            # The file contains OAuth session data in the old format, trying to transform it and retry the login
+            logger.warning('Found legacy OAuth data structure, trying to transform it (%s)', oauth_file)
+            self.transform_legacy_oauth_data_file(oauth_file)
+            return self.try_login_with_existing_data()
+        return self._session.load_oauth_session(session_id, token_type, access_token, refresh_token)
 
     def on_start(self):
-        tidal_config = self.create_tidal_config(self.config)
+        tidal_config = self.create_tidal_config(self.backend_config)
         self._session = Session(tidal_config)
-        # Always store tidal-oauth cache in mopidy core config data_dir
-        oauth_file = self.get_oauth_config_file_path(self.config.default_profile)
-        try:
-            # attempt to reload existing session from file
-            with open(oauth_file) as f:
-                logger.info("Loading OAuth session from %s.", oauth_file)
-                data = json.load(f)
-                self._session.load_oauth_session(
-                    data['session_id'],
-                    data['token_type'],
-                    data['access_token'],
-                    data['refresh_token'],
-                )
-        except:
-            logger.info("Could not load OAuth session from %s" % oauth_file)
+        self.try_login_with_existing_data()
 
         if not self._session.check_login():
-            logger.info("Creating new OAuth session...")
-            self.oauth_login_new_session(oauth_file)
+            self.oauth_login_new_session(self.backend_config.default_profile)
 
         if self._session.check_login():
             logger.info("TIDAL Login OK")

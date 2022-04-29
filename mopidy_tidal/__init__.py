@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 file_dir = os.path.dirname(__file__)
 sys.path.append(file_dir)
 
+
 class Extension(ext.Extension):
 
     dist_name = 'Mopidy-Tidal'
@@ -30,6 +31,7 @@ class Extension(ext.Extension):
         schema['quality'] = config.String(choices=["LOSSLESS", "HIGH", "LOW"])
         schema['client_id'] = config.String(optional=True)
         schema['client_secret'] = config.String(optional=True)
+        schema['profiles'] = config.List(optional=True)
         return schema
 
     def setup(self, registry):
