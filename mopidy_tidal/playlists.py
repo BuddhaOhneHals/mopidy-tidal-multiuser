@@ -49,7 +49,9 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
         logger.debug("Refreshing TIDAL playlists..")
         playlists = {}
         session = self.backend._session
-
+        if not session.user:
+            self._playlists = {}
+            return
         plists = session.user.favorites.playlists()
         for pl in plists:
             pl.name = "* " + pl.name

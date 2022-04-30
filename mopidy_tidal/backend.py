@@ -25,26 +25,9 @@ class TidalBackendConfig(namedtuple('TidalBackendConfig', 'quality client_id cli
     def default_profile(self):
         return self.profiles[0] if self.has_profiles() else None
 
-
-class TidalBackend(ThreadingActor, backend.Backend):
-    def __init__(self, config, audio):
-        super(TidalBackend, self).__init__()
-        self._config = config
-        self.backend_config = self.validate_config(config['tidal'])
-        self.authentication = None
-        self.playback = playback.TidalPlaybackProvider(audio=audio,
-                                                       backend=self)
-        self.library = library.TidalLibraryProvider(backend=self)
-        self.playlists = playlists.TidalPlaylistsProvider(backend=self)
-        self.uri_schemes = ['tidal']
-
-    @property
-    def _session(self):
-        # Helper for backwards compatibility
-        return self.authentication.session
-
-    def validate_config(self, config):
-        """Validate the provided config and return a :class:`TidalBackendConfig` instance.
+    @classmethod
+    def from_dict(cls, config):
+        """Create a :class:`TidalBackendConfig` instance.
 
         :param dict config: A dictionary containing the configuration
         :returns: A validated configuration
@@ -60,7 +43,39 @@ class TidalBackend(ThreadingActor, backend.Backend):
             if client_id or client_secret:
                 logger.warning("Always provide client_id and client_secret together")
             logger.info("Using default client id & client secret from python-tidal")
-        return TidalBackendConfig(quality, client_id, client_secret, profiles)
+        return cls(quality, client_id, client_secret, profiles)
+
+
+class TidalBackend(ThreadingActor, backend.Backend):
+    def __init__(self, config, audio):
+        super(TidalBackend, self).__init__()
+        self.authentication = None
+        self._config = config
+        self.backend_config = TidalBackendConfig.from_dict(config['tidal'])
+        self.playback = playback.TidalPlaybackProvider(audio=audio,
+                                                       backend=self)
+        self.library = library.TidalLibraryProvider(backend=self)
+        self.playlists = playlists.TidalPlaylistsProvider(backend=self)
+        self.uri_schemes = ['tidal']
+
+    @property
+    def _session(self):
+        # Helper for backwards compatibility
+        return self.authentication.session
+
+    @property
+    def available_profiles(self):
+        return self.backend_config.profiles
+
+    @property
+    def active_profile(self):
+        return self.authentication.active_profile
+
+    def switch_profile(self, profile):
+        is_logged_in = self.authentication.login(profile)
+        if is_logged_in:
+            self.library.refresh()
+            self.playlists.refresh()
 
     def create_tidal_config(self, config):
         """Create a tidalapi :class:`tidalapi.Config` object from the given configuration.
@@ -74,15 +89,16 @@ class TidalBackend(ThreadingActor, backend.Backend):
             tidal_config.api_token = config.client_id
         return tidal_config
 
-    def on_start(self):
-        tidal_config = self.create_tidal_config(self.backend_config)
-        self.authentication = TidalAuthentication(tidal_config, storage_path=Extension.get_data_dir(self._config))
-        self.authentication.try_login_with_existing_data(self.backend_config.default_profile)
-
-        if not self._session.check_login():
-            self.authentication.oauth_login_new_session(self.backend_config.default_profile)
-
-        if self._session.check_login():
+    def on_authenticate(self, is_logged_in):
+        if is_logged_in:
             logger.info("TIDAL Login OK")
+            self.library.refresh()
+            self.playlists.refresh()
         else:
             logger.info("TIDAL Login KO")
+
+    def on_start(self):
+        tidal_config = self.create_tidal_config(self.backend_config)
+        self.authentication = TidalAuthentication(tidal_config, storage_path=Extension.get_data_dir(self._config),
+                                                  callback=self.on_authenticate)
+        self.authentication.login(self.backend_config.default_profile)
