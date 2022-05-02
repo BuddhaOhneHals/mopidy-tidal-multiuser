@@ -73,9 +73,7 @@ class TidalBackend(ThreadingActor, backend.Backend):
 
     def switch_profile(self, profile):
         is_logged_in = self.authentication.login(profile)
-        if is_logged_in:
-            self.library.refresh()
-            self.playlists.refresh()
+        return is_logged_in
 
     def create_tidal_config(self, config):
         """Create a tidalapi :class:`tidalapi.Config` object from the given configuration.
