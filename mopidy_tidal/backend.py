@@ -71,6 +71,9 @@ class TidalBackend(ThreadingActor, backend.Backend):
     def active_profile(self):
         return self.authentication.active_profile
 
+    def has_profiles(self):
+        return self.backend_config.has_profiles()
+
     def switch_profile(self, profile):
         is_logged_in = self.authentication.login(profile)
         return is_logged_in
