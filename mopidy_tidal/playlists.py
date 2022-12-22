@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 
+import difflib
 import logging
 import operator
 import os
@@ -8,18 +9,14 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Timer
 from typing import Collection, List, Optional, Tuple, Union
 
-try:
-    # tidalapi >= 0.7.0
-    from tidalapi.playlist import Playlist as TidalPlaylist
-except ImportError:  # pragma: no cover
-    # tidalapi < 0.7.0
-    from tidalapi.models import Playlist as TidalPlaylist
-
 from mopidy import backend
 from mopidy.models import Playlist as MopidyPlaylist
 from mopidy.models import Ref
+from requests import HTTPError
+from tidalapi.playlist import Playlist as TidalPlaylist
 
 from mopidy_tidal import full_models_mappers
+from mopidy_tidal.full_models_mappers import create_mopidy_playlist
 from mopidy_tidal.helpers import to_timestamp
 from mopidy_tidal.lru_cache import LruCache
 from mopidy_tidal.utils import mock_track
@@ -45,6 +42,7 @@ class PlaylistCache(LruCache):
             # The playlist has been updated since last time:
             # we should refresh the associated cache entry
             logger.info('The playlist "%s" has been updated: refresh forced', key.name)
+
             raise KeyError(uri)
 
         return playlist
@@ -61,8 +59,6 @@ class PlaylistMetadataCache(PlaylistCache):
 
 
 class TidalPlaylistsProvider(backend.PlaylistsProvider):
-    PLAYLISTS_SYNC_DOWNTIME_S = 10
-
     def __init__(self, *args, **kwargs):
         super(TidalPlaylistsProvider, self).__init__(*args, **kwargs)
         self._playlists_metadata = PlaylistMetadataCache()
@@ -112,13 +108,8 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
         return added_ids, removed_ids
 
     def _has_changes(self, playlist: MopidyPlaylist):
-        pl_getter = (
-            self.backend._session.get_playlist
-            if hasattr(self.backend._session, "get_playlist")
-            else self.backend._session.playlist
-        )
 
-        upstream_playlist = pl_getter(playlist.uri.split(":")[-1])
+        upstream_playlist = self.backend._session.playlist(playlist.uri.split(":")[-1])
         if not upstream_playlist:
             return True
 
@@ -173,10 +164,38 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
         return self._playlists.get(uri)
 
     def create(self, name):
-        pass  # TODO
+        pl = create_mopidy_playlist(
+            self.backend._session.user.create_playlist(name, ""), []
+        )
+
+        self.refresh(pl.uri)
+        return pl
 
     def delete(self, uri):
-        pass  # TODO
+        playlist_id = uri.split(":")[-1]
+        session = self.backend._session
+
+        try:
+            session.request.request(
+                "DELETE",
+                "playlists/{playlist_id}".format(
+                    playlist_id=playlist_id,
+                ),
+            )
+        except HTTPError as e:
+            # If we got a 401, it's likely that the user is following
+            # this playlist but they don't have permissions for removing
+            # it. If that's the case, remove the playlist from the
+            # favourites instead of deleting it.
+            if e.response.status_code == 401 and uri in {
+                f"tidal:playlist:{pl.id}" for pl in session.user.favorites.playlists()
+            }:
+                session.user.favorites.remove_playlist(playlist_id)
+            else:
+                raise e
+
+        self._playlists_metadata.prune(uri)
+        self._playlists.prune(uri)
 
     def lookup(self, uri):
         return self._get_or_refresh_playlist(uri)
@@ -224,12 +243,18 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
             )
 
         # When we trigger a playlists_loaded event the backend may call as_list
-        # again. Set an event for 5 minutes to ensure that we don't perform
-        # another playlist sync.
+        # again. Set an event in playlist_cache_refresh_secs seconds to ensure
+        # that we don't perform another playlist sync.
         self._playlists_loaded_event.set()
-        Timer(
-            self.PLAYLISTS_SYNC_DOWNTIME_S, lambda: self._playlists_loaded_event.clear()
-        ).start()
+        playlist_cache_refresh_secs = self.backend._config["tidal"].get(
+            "playlist_cache_refresh_secs"
+        )
+
+        if playlist_cache_refresh_secs:
+            Timer(
+                playlist_cache_refresh_secs,
+                lambda: self._playlists_loaded_event.clear(),
+            ).start()
 
         # Update the right playlist cache and send the playlists_loaded event.
         playlist_cache.update(mapped_playlists)
@@ -244,16 +269,59 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
         return [Ref.track(uri=t.uri, name=t.name) for t in playlist.tracks]
 
     def _retrieve_api_tracks(self, session, playlist):
-        if hasattr(session, "get_playlist_tracks"):
-            # tidalapi < 0.7.0
-            getter = session.get_playlist_tracks
-            getter_args = (playlist.id,)
-        else:
-            # tidalapi >= 0.7.0
-            getter = playlist.tracks
-            getter_args = tuple()
-
-        return get_items(getter, *getter_args)
+        getter_args = tuple()
+        return get_items(playlist.tracks, *getter_args)
 
     def save(self, playlist):
-        pass  # TODO
+        old_playlist = self._get_or_refresh_playlist(playlist.uri)
+        session = self.backend._session  # type: ignore
+        playlist_id = playlist.uri.split(":")[-1]
+        assert old_playlist, f"No such playlist: {playlist.uri}"
+        assert session, "No active session"
+        upstream_playlist = session.playlist(playlist_id)
+
+        # Playlist rename case
+        if old_playlist.name != playlist.name:
+            upstream_playlist.edit(title=playlist.name)
+
+        additions = []
+        removals = []
+        remove_offset = 0
+        diff_lines = difflib.ndiff(
+            [t.uri for t in old_playlist.tracks], [t.uri for t in playlist.tracks]
+        )
+
+        for diff_line in diff_lines:
+            if diff_line.startswith("+ "):
+                additions.append(diff_line[2:].split(":")[-1])
+            else:
+                if diff_line.startswith("- "):
+                    removals.append(remove_offset)
+                remove_offset += 1
+
+        # Process removals in descending order so we don't have to recalculate
+        # the offsets while we remove tracks
+        if removals:
+            logger.info(
+                'Removing %d tracks from the playlist "%s"',
+                len(removals),
+                playlist.name,
+            )
+
+            removals.reverse()
+            for idx in removals:
+                upstream_playlist.remove_by_index(idx)
+
+        # tidalapi currently only supports appending tracks to the end of the
+        # playlist
+        if additions:
+            logger.info(
+                'Adding %d tracks to the playlist "%s"', len(additions), playlist.name
+            )
+
+            upstream_playlist.add(additions)
+
+        # remove all defunct tracks from cache
+        self._calculate_added_and_removed_playlist_ids()
+        # force update the whole playlist so all state is good
+        self.refresh(playlist.uri)

@@ -6,7 +6,7 @@ import sys
 
 from mopidy import config, ext
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 
 # TODO: If you need to log, use loggers named after the current Python module
 logger = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class Extension(ext.Extension):
         schema["client_id"] = config.String(optional=True)
         schema["client_secret"] = config.String(optional=True)
         schema["profiles"] = config.List(optional=True)
+        schema["playlist_cache_refresh_secs"] = config.Integer(optional=True)
         return schema
 
     def setup(self, registry):
