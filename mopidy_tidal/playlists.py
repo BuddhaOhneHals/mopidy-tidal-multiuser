@@ -61,7 +61,7 @@ class PlaylistMetadataCache(PlaylistCache):
 
 
 class TidalPlaylistsProvider(backend.PlaylistsProvider):
-    PLAYLISTS_SYNC_DOWNTIME_S = 300
+    PLAYLISTS_SYNC_DOWNTIME_S = 10
 
     def __init__(self, *args, **kwargs):
         super(TidalPlaylistsProvider, self).__init__(*args, **kwargs)
@@ -180,6 +180,14 @@ class TidalPlaylistsProvider(backend.PlaylistsProvider):
 
     def lookup(self, uri):
         return self._get_or_refresh_playlist(uri)
+
+    def force_refresh(self, include_items: bool = True):
+        logger.info("Force reloading the playlists from TIDAL")
+        self._playlists_metadata = PlaylistMetadataCache()
+        self._playlists = PlaylistCache()
+        self._playlists_loaded_event.clear()
+        self._calculate_added_and_removed_playlist_ids()
+        self.refresh(include_items=False)
 
     def refresh(self, *uris, include_items: bool = True):
         if uris:

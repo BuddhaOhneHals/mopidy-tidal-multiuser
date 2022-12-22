@@ -1,109 +1,100 @@
 from __future__ import unicode_literals
 
-import json
 import logging
-import os
+from collections import namedtuple
 
 from mopidy import backend
 from pykka import ThreadingActor
 from tidalapi import Config, Quality, Session
 
 from mopidy_tidal import Extension, context, library, playback, playlists
+from mopidy_tidal.authentication import TidalAuthentication
 
 logger = logging.getLogger(__name__)
 
-try:
-    from tidalapi import __version__
 
-    has_python_tidal_0_7 = True
-except ImportError:  # pragma: no cover
-    has_python_tidal_0_7 = False
+class TidalBackendConfig(namedtuple('TidalBackendConfig', 'quality client_id client_secret profiles')):
+    def has_profiles(self):
+        return len(self.profiles) > 0
+
+    @property
+    def default_profile(self):
+        return self.profiles[0] if self.has_profiles() else None
+
+    @classmethod
+    def from_dict(cls, config):
+        """Create a :class:`TidalBackendConfig` instance.
+
+        :param dict config: A dictionary containing the configuration
+        :returns: A validated configuration
+        :rtype: TidalBackendConfig
+        """
+        quality = Quality(config["quality"])
+        client_id = config["client_id"]
+        client_secret = config["client_secret"]
+        profiles = config["profiles"]
+        if client_id and client_secret:
+            logger.info("client_id & client_secret from config section are used.")
+        else:
+            if client_id or client_secret:
+                logger.warning("Always provide client_id and client_secret together")
+            logger.info("Using default client id & client secret from python-tidal")
+        return cls(quality, client_id, client_secret, profiles)
 
 
 class TidalBackend(ThreadingActor, backend.Backend):
     def __init__(self, config, audio):
         super(TidalBackend, self).__init__()
-        self._session = None
+        self.authentication = None
         self._config = config
         context.set_config(self._config)
+        self.backend_config = TidalBackendConfig.from_dict(config['tidal'])
         self.playback = playback.TidalPlaybackProvider(audio=audio, backend=self)
         self.library = library.TidalLibraryProvider(backend=self)
         self.playlists = playlists.TidalPlaylistsProvider(backend=self)
         self.uri_schemes = ["tidal"]
 
-    def oauth_login_new_session(self, oauth_file):
-        # create a new session
-        self._session.login_oauth_simple(function=logger.info)
-        if self._session.check_login():
-            # store current OAuth session
-            data = {}
-            data["token_type"] = {"data": self._session.token_type}
-            data["session_id"] = {"data": self._session.session_id}
-            data["access_token"] = {"data": self._session.access_token}
-            data["refresh_token"] = {"data": self._session.refresh_token}
-            with open(oauth_file, "w") as outfile:
-                json.dump(data, outfile)
+    @property
+    def _session(self):
+        # Helper for backwards compatibility
+        return self.authentication.session
 
-    def on_start(self):
-        quality = self._config["tidal"]["quality"]
-        logger.info("Connecting to TIDAL.. Quality = %s" % quality)
-        config = Config(quality=Quality(quality))
-        client_id = self._config["tidal"]["client_id"]
-        client_secret = self._config["tidal"]["client_secret"]
+    @property
+    def available_profiles(self):
+        return self.backend_config.profiles
 
-        if (client_id and not client_secret) or (client_secret and not client_id):
-            logger.warn(
-                "Connecting to TIDAL.. always provide client_id and client_secret together"
-            )
-            logger.info(
-                "Connecting to TIDAL.. using default client id & client secret from python-tidal"
-            )
+    @property
+    def active_profile(self):
+        return self.authentication.active_profile
 
-        if client_id and client_secret:
-            logger.info(
-                "Connecting to TIDAL.. client id & client secret from config section are used"
-            )
-            config.client_id = client_id
-            config.api_token = client_id
-            config.client_secret = client_secret
+    def has_profiles(self):
+        return self.backend_config.has_profiles()
 
-        if not client_id and not client_secret:
-            logger.info(
-                "Connecting to TIDAL.. using default client id & client secret from python-tidal"
-            )
+    def switch_profile(self, profile):
+        is_logged_in = self.authentication.login(profile)
+        return is_logged_in
 
-        self._session = Session(config)
-        # Always store tidal-oauth cache in mopidy core config data_dir
-        data_dir = Extension.get_data_dir(self._config)
-        oauth_file = os.path.join(data_dir, "tidal-oauth.json")
-        try:
-            # attempt to reload existing session from file
-            with open(oauth_file) as f:
-                logger.info("Loading OAuth session from %s...", oauth_file)
-                data = json.load(f)
-                self._load_oauth_session(**data)
-        except Exception as e:
-            logger.info("Could not load OAuth session from %s: %s", oauth_file, e)
+    def create_tidal_config(self, config):
+        """Create a tidalapi :class:`tidalapi.Config` object from the given configuration.
 
-        if not self._session.check_login():
-            logger.info("Creating new OAuth session...")
-            self.oauth_login_new_session(oauth_file)
+        :param TidalBackendConfig config: The configuration
+        """
+        tidal_config = Config(quality=config.quality)
+        if config.client_id and config.client_secret:
+            tidal_config.client_secret = config.client_secret
+            tidal_config.client_id = config.client_id
+            tidal_config.api_token = config.client_id
+        return tidal_config
 
-        if self._session.check_login():
+    def on_authenticate(self, is_logged_in):
+        if is_logged_in:
             logger.info("TIDAL Login OK")
+            self.playlists.force_refresh()
         else:
             logger.info("TIDAL Login KO")
 
-    def _load_oauth_session(self, **data):
-        assert self._session, "No session loaded"
-        args = {
-            "token_type": data.get("token_type", {}).get("data"),
-            "access_token": data.get("access_token", {}).get("data"),
-            "refresh_token": data.get("refresh_token", {}).get("data"),
-        }
-
-        # tidalapi < 0.7 also requires the session_id for load_oauth_session
-        if not has_python_tidal_0_7:
-            args["session_id"] = data.get("session_id", {}).get("data")
-
-        self._session.load_oauth_session(**args)
+    def on_start(self):
+        tidal_config = self.create_tidal_config(self.backend_config)
+        self.authentication = TidalAuthentication(tidal_config, storage_path=Extension.get_data_dir(self._config),
+                                                  callback=self.on_authenticate)
+        self.authentication.login(self.backend_config.default_profile)
