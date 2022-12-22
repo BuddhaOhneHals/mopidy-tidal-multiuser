@@ -60,6 +60,10 @@ class TidalBackend(ThreadingActor, backend.Backend):
         return self.authentication.session
 
     @property
+    def user(self):
+        return self.authentication.session.user
+
+    @property
     def available_profiles(self):
         return self.backend_config.profiles
 
